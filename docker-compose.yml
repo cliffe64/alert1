@@ -1,0 +1,29 @@
+version: "3.9"
+
+services:
+  core:
+    build: .
+    command: ["python", "run.py", "--loop"]
+    environment:
+      - ALERT_DB_PATH=/data/alert.db
+    volumes:
+      - alert-data:/data
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  ui:
+    build: .
+    command: ["streamlit", "run", "ui/app.py", "--server.port=8501", "--server.address=0.0.0.0"]
+    environment:
+      - ALERT_DB_PATH=/data/alert.db
+    volumes:
+      - alert-data:/data
+    ports:
+      - "8501:8501"
+    depends_on:
+      - core
+
+volumes:
+  alert-data:
+    driver: local

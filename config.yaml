@@ -1,0 +1,75 @@
+symbols: ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
+timeframes: ["5m", "15m"]
+
+volume_spike:
+  mode: "zscore"
+  zscore:
+    lookback_windows: 96
+    z_thr: 3.0
+    min_notional_usd: 50000
+    min_abs_return: 0.005
+  multiplier:
+    buckets:
+      major:
+        symbols: ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
+        mult: 1.5
+        min_notional_usd: 100000
+      mid:
+        symbols: []
+        mult: 2.0
+        min_notional_usd: 50000
+      small:
+        symbols: []
+        mult: 3.0
+        min_notional_usd: 20000
+    min_abs_return: 0.005
+
+trend_channel:
+  window: 30
+  r2_min: 0.6
+  slope_norm_min: 0.0003
+  slope_norm_max: 0.003
+  resid_atr_max: 1.0
+  pullback_atr_max: 0.5
+  breakout_atr_mult: 1.5
+  vol_confirm_z: 2.0
+
+price_alerts:
+  BTCUSDT:
+    - type: "above"
+      level: 70000
+      hysteresis: 200
+      confirm:
+        mode: "time"
+        seconds: 15
+      message: "BTC到达一级目标 70k：考虑按计划减仓10%"
+    - type: "above"
+      level: 75000
+      hysteresis: 200
+      confirm:
+        mode: "samples"
+        total: 3
+        pass: 2
+      message: "BTC到达二级目标 75k：考虑再减10%"
+    - type: "below"
+      level: 62000
+      hysteresis: 150
+      confirm:
+        mode: "bar_close"
+        timeframe: "5m"
+      message: "BTC跌破 62k：检查风控预案"
+
+notifiers:
+  dingtalk:
+    enabled: true
+    webhook_env: "DINGTALK_WEBHOOK"
+    secret_env: "DINGTALK_SECRET"
+  local_sound:
+    enabled: true
+    sound_file: "./sounds/alert.wav"
+    volume: 0.8
+
+cooldown_minutes: 12
+notification_rate_limit_minutes: 5
+ui:
+  timezone_display: "local"
