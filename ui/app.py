@@ -22,6 +22,7 @@ import streamlit as st
 
 from alerts import dingtalk, local_sound
 from connectors.binance_provider import BinanceFuturesProvider
+from connectors.onchain_provider import OnChainProvider
 from core.config_models import EndpointEntry, MonitoredTarget, ThresholdRule
 from core.health import Endpoint, EndpointPool
 from core.health_checker import probe_endpoints
@@ -181,7 +182,12 @@ def _endpoint_pool_panel(config) -> Optional[List[Dict[str, object]]]:
 def _target_rules_panel(config) -> None:
     st.header("监控对象与规则")
     provider = BinanceFuturesProvider()
+    onchain_provider = OnChainProvider()
     provider.configure_endpoints(
+        EndpointConfig(name=ep.name, base_url=ep.base_url, api_key=ep.api_key, priority=ep.priority)
+        for ep in config.endpoints
+    )
+    onchain_provider.configure_endpoints(
         EndpointConfig(name=ep.name, base_url=ep.base_url, api_key=ep.api_key, priority=ep.priority)
         for ep in config.endpoints
     )
@@ -203,6 +209,26 @@ def _target_rules_panel(config) -> None:
                     st.rerun()
             else:
                 st.info("未找到匹配合约，可尝试输入合约地址兜底。")
+        except Exception as exc:
+            st.error(f"搜索失败: {exc}")
+
+    st.subheader("通过名称搜索链上代币")
+    onchain_query = st.text_input("输入名称/符号搜索链上代币", key="onchain_query")
+    if onchain_query:
+        try:
+            matches = onchain_provider.search_tokens(onchain_query)
+            if matches:
+                options = {f"{m.symbol} | {m.name}": m for m in matches}
+                choice = st.selectbox("链上搜索结果", list(options.keys()), key="onchain_choice")
+                if st.button("添加链上监控目标"):
+                    token = options[choice]
+                    target = MonitoredTarget(token=token, rules=[], enabled=True)
+                    updated = app_config_store.upsert_target(config, target)
+                    st.success("已添加链上监控对象")
+                    st.session_state["config"] = updated
+                    st.rerun()
+            else:
+                st.info("未找到匹配代币，可尝试输入合约地址兜底。")
         except Exception as exc:
             st.error(f"搜索失败: {exc}")
 

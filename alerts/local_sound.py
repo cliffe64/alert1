@@ -1,13 +1,15 @@
-"""Local audio playback helper with graceful degradation."""
+"""Local audio playback helper with a notifier wrapper."""
 
 from __future__ import annotations
 
 import logging
-import os
 import platform
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+from alerts.notifiers.base import Notifier, NotifierTestResult, NotificationMessage
 
 LOGGER = logging.getLogger(__name__)
 
@@ -69,4 +71,31 @@ def test_play(sound_file: Optional[str] = None) -> None:
     play(sound_file)
 
 
-__all__ = ["play", "test_play"]
+@dataclass(slots=True)
+class LocalSoundNotifier(Notifier):
+    """本地声音通道，实现统一通知接口。"""
+
+    enabled_flag: bool
+    sound_file: Optional[str] = None
+    volume: float = 1.0
+    name: str = "local_sound"
+
+    def enabled(self) -> bool:
+        return self.enabled_flag
+
+    async def send(self, message: NotificationMessage) -> bool:
+        if not self.enabled():
+            return False
+        play(self.sound_file, self.volume)
+        LOGGER.info("Local sound triggered for message: %s", message.title)
+        return True
+
+    async def self_test(self) -> NotifierTestResult:
+        try:
+            play(self.sound_file, self.volume)
+            return NotifierTestResult(ok=True, detail="Local sound played")
+        except Exception as exc:  # pragma: no cover - environment dependent
+            return NotifierTestResult(ok=False, detail=str(exc))
+
+
+__all__ = ["play", "test_play", "LocalSoundNotifier"]

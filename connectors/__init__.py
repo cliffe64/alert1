@@ -8,6 +8,7 @@ from .dex_api import (
     register_adapter,
     sync_registered_tokens,
 )
+from .onchain_provider import OnChainProvider
 
 __all__ = [
     "BinanceClients",
@@ -18,4 +19,5 @@ __all__ = [
     "fetch_1m_bar",
     "register_adapter",
     "sync_registered_tokens",
+    "OnChainProvider",
 ]

@@ -1,4 +1,4 @@
-"""DingTalk notification helper."""
+"""DingTalk notification helper and notifier implementation."""
 
 from __future__ import annotations
 
@@ -7,10 +7,13 @@ import hashlib
 import hmac
 import logging
 import time
+from dataclasses import dataclass
 from typing import Optional
 from urllib.parse import urlencode
 
 import httpx
+
+from alerts.notifiers.base import Notifier, NotifierTestResult, NotificationMessage
 
 LOGGER = logging.getLogger(__name__)
 
@@ -46,4 +49,43 @@ async def send_test(webhook: str, secret: Optional[str] = None) -> None:
     await send_markdown("Alert Service Test", "Test message", webhook, secret)
 
 
-__all__ = ["send_markdown", "send_test"]
+@dataclass(slots=True)
+class DingTalkNotifier(Notifier):
+    """DingTalk 通知器，实现统一接口便于扩展。"""
+
+    webhook: Optional[str]
+    secret: Optional[str]
+    enabled_flag: bool
+    name: str = "dingtalk"
+
+    def enabled(self) -> bool:
+        return self.enabled_flag and bool(self.webhook)
+
+    async def send(self, message: NotificationMessage) -> bool:
+        if not self.enabled():
+            LOGGER.info("DingTalk notifier disabled or missing webhook; skip send")
+            return False
+        try:
+            await send_markdown(message.title, message.body, self.webhook or "", self.secret)
+            return True
+        except Exception as exc:  # pragma: no cover - network errors
+            LOGGER.exception("Failed to send DingTalk message: %s", exc)
+            return False
+
+    async def self_test(self) -> NotifierTestResult:
+        if not self.webhook:
+            return NotifierTestResult(ok=False, detail="Missing webhook for DingTalk")
+        try:
+            await send_markdown(
+                "[TEST] 通知自检",
+                "# DingTalk 通道联通\n- 结果: 成功",
+                self.webhook,
+                self.secret,
+            )
+            return NotifierTestResult(ok=True, detail="DingTalk webhook reachable")
+        except Exception as exc:  # pragma: no cover - network errors
+            LOGGER.exception("DingTalk self-test failed: %s", exc)
+            return NotifierTestResult(ok=False, detail=str(exc))
+
+
+__all__ = ["send_markdown", "send_test", "DingTalkNotifier"]

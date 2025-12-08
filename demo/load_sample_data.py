@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from aggregator.rollup import rollup_bars
-from alerts.router import dispatch_new_events
 from rules.price_alerts import scan_price_alerts
 from rules.trend_channel import scan_trend_channel
 from rules.volume_spike import run_volume_spike
@@ -62,7 +61,6 @@ async def _run_rules() -> None:
     await asyncio.to_thread(scan_trend_channel, "5m")
     await asyncio.to_thread(scan_trend_channel, "15m")
     await asyncio.to_thread(scan_price_alerts)
-    await dispatch_new_events()
 
 
 def main(argv: Optional[Iterable[str]] = None) -> None:
