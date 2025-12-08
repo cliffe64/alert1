@@ -80,6 +80,12 @@ python -m backtest.replay --symbols BTCUSDT,ETHUSDT --days 7 --timeframe 5m
 
 Outputs are written to `backtest/out/` including per-event CSV, summary CSV, and a return distribution chart.
 
+## Architecture
+
+The target modular design and user-facing configuration expectations are documented in
+`docs/architecture.md`. 该文档使用中文逐条对应需求，描述了前端优先配置、名称联想添加、
+endpoint 池容灾、事件总线与可插拔通知器/数据源的分层，让后续扩展保持低耦合。
+
 ## Project Structure
 ```
 connectors/            # Market data adapters
