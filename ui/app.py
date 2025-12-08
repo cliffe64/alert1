@@ -9,17 +9,25 @@ import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 # ----------------
 
+import asyncio
 import csv
 import io
 import json
 import time
+from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 import streamlit as st
 
-from rules.config_loader import load_config
+from alerts import dingtalk, local_sound
+from connectors.binance_provider import BinanceFuturesProvider
+from core.config_models import EndpointEntry, MonitoredTarget, ThresholdRule
+from core.health import Endpoint, EndpointPool
+from core.health_checker import probe_endpoints
+from core.providers import EndpointConfig, TokenDescriptor
 from storage import sqlite_manager
+from storage import app_config_store
 
 
 def _format_ts(ts: int) -> str:
@@ -28,23 +36,23 @@ def _format_ts(ts: int) -> str:
 
 def _dashboard() -> None:
     st.header("行情仪表盘")
-    config = load_config()
+    config = st.session_state.get("config") or app_config_store.load_app_config()
     cols = st.columns(2)
     with cols[0]:
         st.subheader("最新价 / 涨跌")
         rows: List[Dict[str, object]] = []
-        for symbol in config.symbols:
+        for target in config.targets:
+            symbol = target.token.symbol
             bar = sqlite_manager.fetch_latest_bar("bars_1m", symbol)
-            if not bar:
-                continue
-            rows.append(
-                {
-                    "symbol": symbol,
-                    "close": bar["close"],
-                    "close_ts": _format_ts(int(bar["close_ts"])),
-                }
-            )
-        st.dataframe(rows)
+            if bar:
+                rows.append(
+                    {
+                        "symbol": symbol,
+                        "close": bar["close"],
+                        "close_ts": _format_ts(int(bar["close_ts"])),
+                    }
+                )
+        st.dataframe(rows or [{"提示": "请先在监控配置中添加合约/代币"}])
     with cols[1]:
         st.subheader("最近事件")
         events = sqlite_manager.fetch_undelivered_events(limit=20)
@@ -61,152 +69,229 @@ def _dashboard() -> None:
         st.dataframe(table)
 
 
-def _price_alerts() -> None:
-    st.header("价格提醒规则")
-    rules = sqlite_manager.list_rules()
-    st.dataframe(rules)
-    st.caption("规则的 CRUD 可直接通过数据库或后续版本完善。")
+def _log_panel(latest_health: Optional[List[Dict[str, object]]] = None) -> None:
+    st.subheader("运行日志与状态")
+    events = sqlite_manager.fetch_undelivered_events(limit=50)
+    st.write("价格/系统事件 (最新 50 条)：")
+    st.dataframe(
+        [
+            {
+                "id": e["id"],
+                "type": e.get("event_type", "price"),
+                "symbol": e.get("symbol"),
+                "severity": e.get("severity"),
+                "message": e.get("message"),
+                "ts": _format_ts(int(e["ts"])),
+            }
+            for e in events
+        ]
+    )
+
+    if latest_health:
+        st.write("Endpoint 健康检查结果：")
+        st.dataframe(latest_health)
 
 
-def _volume_trend_config() -> None:
-    st.header("放量 / 趋势参数")
-    config = load_config()
-    st.json({"volume_spike": config.volume_spike.mode.value, "trend_channel": config.trend_channel.__dict__})
+def _notifier_settings(config) -> None:
+    st.header("告警通道开关与测试")
+    st.caption("三个通道独立开关，点击按钮立即测试。Telegram 预留接口。")
+    for notifier in config.notifiers:
+        col1, col2, col3 = st.columns([1, 2, 2])
+        with col1:
+            enabled = st.checkbox(f"{notifier.name} 启用", value=notifier.enabled, key=f"{notifier.name}_enabled")
+        with col2:
+            st.write("可测试" if notifier.testable else "预留")
+        with col3:
+            if notifier.testable and st.button(f"测试 {notifier.name}", key=f"btn_{notifier.name}"):
+                _run_notifier_test(notifier.name)
+        if enabled != notifier.enabled:
+            updated = app_config_store.update_notifier(config, notifier.name, enabled)
+            st.success("已更新通知开关")
+            st.session_state["config"] = updated
 
 
-def _notification_settings() -> None:
-    st.header("通知设置")
-    config = load_config()
-    ding = config.notifiers.dingtalk
-    st.subheader("钉钉")
-    st.write({"enabled": ding.enabled, "webhook": ding.webhook, "secret": bool(ding.secret)})
-    if st.button("测试钉钉推送"):
-        st.info("请在服务端运行 alerts.router.dispatch_new_events() 触发测试")
-    sound = config.notifiers.local_sound
-    st.subheader("本地声音")
-    st.write({"enabled": sound.enabled, "sound_file": sound.sound_file, "volume": sound.volume})
+def _run_notifier_test(channel: str) -> None:
+    try:
+        if channel == "dingtalk":
+            webhook = os.environ.get("DINGTALK_WEBHOOK")
+            secret = os.environ.get("DINGTALK_SECRET")
+            if not webhook:
+                st.error("未配置 DINGTALK_WEBHOOK")
+                return
+            title = "[TEST] 系统告警通道自检"
+            text = "# 通知自检\n- 频道: 钉钉\n- 结果: 成功触发"
+            asyncio.run(dingtalk.send_markdown(title, text, webhook, secret))
+            st.success("钉钉消息已发送")
+        elif channel == "local_sound":
+            local_sound.play(None)
+            st.success("已触发本地声音")
+        else:
+            st.info("Telegram 通道预留，待补充凭据后启用。")
+    except Exception as exc:  # pragma: no cover - runtime feedback
+        st.error(f"测试失败: {exc}")
 
 
-def _token_registry() -> None:
-    st.header("代币注册表")
-    tokens = sqlite_manager.list_tokens()
-    st.dataframe(tokens)
+def _endpoint_pool_panel(config) -> Optional[List[Dict[str, object]]]:
+    st.header("Endpoint 池配置与健康检查")
+    st.caption("前端可新增/编辑/删除/排序接口，运行时自动切换。")
+    st.dataframe([asdict(ep) for ep in config.endpoints])
+    with st.form("endpoint_form"):
+        name = st.text_input("名称", value="")
+        base_url = st.text_input("Base URL", value="https://fapi.binance.com")
+        api_key = st.text_input("API Key", value="", type="password")
+        priority = st.number_input("优先级(数字越小优先)", value=0, step=1)
+        submitted = st.form_submit_button("保存/更新")
+        if submitted and name and base_url:
+            entry = EndpointEntry(name=name, base_url=base_url, api_key=api_key or None, priority=int(priority))
+            updated = app_config_store.upsert_endpoint(config, entry)
+            st.success("已保存 Endpoint")
+            st.session_state["config"] = updated
+            st.rerun()
 
-    st.subheader("新增或更新代币")
-    with st.form("token_form"):
-        selected_id = st.selectbox(
-            "选择已有代币 (可留空新增)",
-            ["<新增>"] + [token["id"] for token in tokens],
+    delete_name = st.selectbox("删除 endpoint", options=["<选择>"] + [ep.name for ep in config.endpoints])
+    if delete_name != "<选择>" and st.button("删除所选"):
+        updated = app_config_store.delete_endpoint(config, delete_name)
+        st.success("已删除")
+        st.session_state["config"] = updated
+        st.rerun()
+
+    if st.button("立即健康检查"):
+        pool = EndpointPool(
+            Endpoint(name=ep.name, base_url=ep.base_url, api_key=ep.api_key, priority=ep.priority)
+            for ep in app_config_store.load_app_config().endpoints
         )
-        existing: Optional[Dict[str, object]] = None
-        if selected_id != "<新增>":
-            existing = next(token for token in tokens if token["id"] == selected_id)
-        token_id = st.text_input("唯一 ID", value=(existing["id"] if existing else ""))
-        symbol = st.text_input("交易对符号", value=(existing["symbol"] if existing else ""))
-        exchange = st.text_input("交易所", value=(existing["exchange"] if existing else "pancake"))
-        chain = st.text_input("链", value=(existing["chain"] if existing else "BNB"))
-        token_address = st.text_input(
-            "Token 地址",
-            value=(existing["token_address"] if existing else ""),
-        )
-        pool_address = st.text_input(
-            "Pool 地址",
-            value=(existing.get("pool_address") if existing else ""),
-        )
-        base = st.text_input("基础资产", value=(existing.get("base") if existing else ""))
-        quote = st.text_input("计价资产", value=(existing.get("quote") if existing else "USDT"))
-        decimals = st.number_input(
-            "小数位",
-            value=int(existing.get("decimals", 18) if existing else 18),
-            min_value=0,
-            max_value=36,
-            step=1,
-        )
-        enabled = st.checkbox("启用", value=bool(existing and existing.get("enabled")))
-        extra_json = st.text_area(
-            "附加信息(JSON)",
-            value=(existing.get("extra_json") if existing else "{}"),
-        )
-        submitted = st.form_submit_button("保存")
-        if submitted:
-            if not token_id or not symbol:
-                st.error("ID 与 symbol 为必填字段")
-            else:
-                payload = {
-                    "id": token_id,
-                    "source": "dex",
-                    "exchange": exchange,
-                    "chain": chain,
-                    "symbol": symbol,
-                    "base": base,
-                    "quote": quote,
-                    "token_address": token_address,
-                    "pool_address": pool_address or None,
-                    "decimals": int(decimals),
-                    "enabled": 1 if enabled else 0,
-                    "extra_json": extra_json or "{}",
-                    "created_at": int(existing.get("created_at", time.time()) if existing else time.time()),
-                }
-                sqlite_manager.upsert_token(payload)
-                st.success("保存成功")
-                st.rerun()  # 修复：使用 st.rerun()
+        results = asyncio.run(probe_endpoints(pool))
+        latest_health = [
+            {
+                "name": r.endpoint.name,
+                "base_url": r.endpoint.base_url,
+                "ok": r.ok,
+                "reason": r.reason,
+                "latency_ms": r.latency_ms,
+                "failures": r.endpoint.consecutive_failures,
+            }
+            for r in results
+        ]
+        st.session_state["latest_health"] = latest_health
+        st.success("健康检查完成")
+        return latest_health
+    return st.session_state.get("latest_health")
 
-    st.subheader("批量导入 CSV")
-    uploaded = st.file_uploader("选择 CSV 文件", type=["csv"])
-    if uploaded is not None:
+
+def _target_rules_panel(config) -> None:
+    st.header("监控对象与规则")
+    provider = BinanceFuturesProvider()
+    provider.configure_endpoints(
+        EndpointConfig(name=ep.name, base_url=ep.base_url, api_key=ep.api_key, priority=ep.priority)
+        for ep in config.endpoints
+    )
+
+    st.subheader("通过名称搜索币安合约")
+    query = st.text_input("输入名称/符号搜索", key="futures_query")
+    if query:
         try:
-            content = uploaded.read().decode("utf-8")
-            reader = csv.DictReader(io.StringIO(content))
-            imported = 0
-            for row in reader:
-                payload = {
-                    "id": row.get("id") or f"token-{imported}",
-                    "source": row.get("source", "dex"),
-                    "exchange": row.get("exchange", "pancake"),
-                    "chain": row.get("chain", "BNB"),
-                    "symbol": row.get("symbol", ""),
-                    "base": row.get("base", ""),
-                    "quote": row.get("quote", "USDT"),
-                    "token_address": row.get("token_address", ""),
-                    "pool_address": row.get("pool_address"),
-                    "decimals": int(row.get("decimals", 18) or 18),
-                    "enabled": 1 if str(row.get("enabled", "1")) in {"1", "true", "True"} else 0,
-                    "extra_json": row.get("extra_json", "{}"),
-                    "created_at": int(time.time()),
-                }
-                sqlite_manager.upsert_token(payload)
-                imported += 1
-            st.success(f"已导入 {imported} 条记录")
-            st.rerun()  # 修复：使用 st.rerun()
-        except Exception as exc:  # pragma: no cover - Streamlit runtime
-            st.error(f"导入失败: {exc}")
+            matches = provider.search_tokens(query)
+            if matches:
+                options = {f"{m.symbol} | {m.name}": m for m in matches}
+                choice = st.selectbox("搜索结果", list(options.keys()))
+                if st.button("添加为监控目标"):
+                    token = options[choice]
+                    target = MonitoredTarget(token=token, rules=[], enabled=True)
+                    updated = app_config_store.upsert_target(config, target)
+                    st.success("已添加监控对象")
+                    st.session_state["config"] = updated
+                    st.rerun()
+            else:
+                st.info("未找到匹配合约，可尝试输入合约地址兜底。")
+        except Exception as exc:
+            st.error(f"搜索失败: {exc}")
+
+    st.subheader("地址兜底添加链上代币")
+    addr = st.text_input("合约地址", key="address_add")
+    chain = st.text_input("链(可选)", key="address_chain")
+    name = st.text_input("名称(可选)", key="address_name")
+    if st.button("地址添加"):
+        token = TokenDescriptor(
+            identifier=addr,
+            name=name or addr,
+            symbol=(name or addr)[:10],
+            chain=chain or None,
+            address=addr,
+        )
+        target = MonitoredTarget(token=token, rules=[], enabled=True)
+        updated = app_config_store.upsert_target(config, target)
+        st.success("已通过地址添加")
+        st.session_state["config"] = updated
+        st.rerun()
+
+    st.subheader("已配置监控对象")
+    if not config.targets:
+        st.info("暂无监控对象")
+    for target in config.targets:
+        with st.expander(f"{target.token.symbol} / {target.token.name}"):
+            st.json(target.token.__dict__)
+            st.write("规则列表")
+            if target.rules:
+                st.table([rule.__dict__ for rule in target.rules])
+            with st.form(f"rule_form_{target.token.identifier}"):
+                rule_id = st.text_input("规则 ID", key=f"rule_id_{target.token.identifier}")
+                compare = st.selectbox("比较方式", ["gt", "lt", "cross_up", "cross_down"], key=f"cmp_{target.token.identifier}")
+                threshold = st.number_input("阈值", value=0.0, key=f"thr_{target.token.identifier}")
+                freq = st.number_input("触发频率(秒)", value=60, step=1, key=f"freq_{target.token.identifier}")
+                cooldown = st.number_input("冷却时间(秒)", value=300, step=1, key=f"cool_{target.token.identifier}")
+                submitted = st.form_submit_button("追加规则")
+                if submitted and rule_id:
+                    new_rule = ThresholdRule(
+                        rule_id=rule_id,
+                        compare=compare,
+                        threshold=float(threshold),
+                        frequency_sec=int(freq),
+                        cooldown_sec=int(cooldown),
+                    )
+                    updated_rules = target.rules + [new_rule]
+                    updated_target = MonitoredTarget(token=target.token, rules=updated_rules, enabled=target.enabled)
+                    updated = app_config_store.upsert_target(config, updated_target)
+                    st.success("规则已添加")
+                    st.session_state["config"] = updated
+                    st.rerun()
+            if st.button("删除该监控对象", key=f"del_{target.token.identifier}"):
+                updated = app_config_store.delete_target(config, target.token.identifier)
+                st.success("已删除监控对象")
+                st.session_state["config"] = updated
+                st.rerun()
 
 
 def main() -> None:
     st.set_page_config(page_title="Alert Service", layout="wide")
+    if "config" not in st.session_state:
+        st.session_state["config"] = app_config_store.load_app_config()
+    config = st.session_state["config"]
+
     page = st.sidebar.selectbox(
         "功能模块",
         (
             "仪表盘",
-            "价格提醒",
-            "放量/趋势配置",
-            "通知设置",
-            "代币注册表",
+            "监控配置",
+            "Endpoint 池",
+            "告警通道",
+            "日志",
         ),
     )
     if st.sidebar.button("刷新配置"):
-        st.rerun()  # 修复：使用 st.rerun()
+        st.session_state["config"] = app_config_store.load_app_config()
+        st.rerun()
 
     if page == "仪表盘":
         _dashboard()
-    elif page == "价格提醒":
-        _price_alerts()
-    elif page == "放量/趋势配置":
-        _volume_trend_config()
-    elif page == "通知设置":
-        _notification_settings()
+    elif page == "监控配置":
+        _target_rules_panel(config)
+    elif page == "Endpoint 池":
+        health = _endpoint_pool_panel(config)
+        _log_panel(latest_health=health)
+    elif page == "告警通道":
+        _notifier_settings(config)
     else:
-        _token_registry()
+        _log_panel(latest_health=st.session_state.get("latest_health"))
 
 
 if __name__ == "__main__":
