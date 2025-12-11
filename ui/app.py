@@ -236,6 +236,16 @@ def _target_rules_panel(config) -> None:
     addr = st.text_input("合约地址", key="address_add")
     chain = st.text_input("链(可选)", key="address_chain")
     name = st.text_input("名称(可选)", key="address_name")
+    if st.button("验证地址"):
+        if not addr:
+            st.warning("请输入要验证的合约地址")
+        else:
+            token = onchain_provider.resolve_token(addr)
+            if token:
+                st.success("地址格式有效，可添加监控")
+                st.json(token.__dict__)
+            else:
+                st.error("无法解析该地址")
     if st.button("地址添加"):
         token = TokenDescriptor(
             identifier=addr,
