@@ -159,12 +159,19 @@ def _build_event(rule: Dict[str, object], price: float, now_ts: int) -> Dict[str
     }
 
 
-def scan_price_alerts(now_ts: Optional[int] = None) -> List[Dict[str, object]]:
+def scan_price_alerts(
+    now_ts: Optional[int] = None,
+    price_overrides: Optional[Dict[str, float]] = None,
+    rules: Optional[List[Dict[str, object]]] = None,
+) -> List[Dict[str, object]]:
     now = now_ts or _now_ts()
-    rules = sqlite_manager.list_rules(enabled=True)
+    active_rules = rules if rules is not None else sqlite_manager.list_rules(enabled=True)
+    overrides = price_overrides or {}
     events: List[Dict[str, object]] = []
-    for rule in rules:
-        price = _latest_price(rule["symbol"])
+    for rule in active_rules:
+        price = overrides.get(rule["symbol"]) if overrides else None
+        if price is None:
+            price = _latest_price(rule["symbol"])
         if price is None:
             continue
         state = _load_state(rule["id"])

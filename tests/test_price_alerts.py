@@ -87,3 +87,14 @@ def test_price_alert_time_confirm_and_hysteresis(setup_db):
     scan_price_alerts(now_ts=833)
     events = fetch_undelivered_events()
     assert len(events) == 2
+
+
+def test_price_alert_respects_price_override(setup_db):
+    rule = _rule("override", level=105, hysteresis=0)
+    rule["confirm_mode"] = None
+    upsert_rule(rule)
+
+    scan_price_alerts(now_ts=100, price_overrides={"BTCUSDT": 110})
+    events = fetch_undelivered_events()
+
+    assert len(events) == 1

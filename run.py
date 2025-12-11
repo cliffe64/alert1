@@ -1,6 +1,6 @@
-"""Main entry point orchestrating the alert service."""
-
 from __future__ import annotations
+
+"""Main entry point orchestrating the alert service."""
 
 import argparse
 import asyncio
@@ -13,7 +13,7 @@ from connectors import sync_registered_tokens
 from connectors.binance_provider import BinanceFuturesProvider
 from connectors.onchain_provider import OnChainProvider
 from core.event_bus import EventBus
-from core.providers import EndpointConfig, Provider, TokenDescriptor
+from core.providers import EndpointConfig, TokenDescriptor
 from rules.price_alerts import scan_price_alerts
 from rules.trend_channel import scan_trend_channel
 from rules.volume_spike import run_volume_spike
@@ -65,6 +65,19 @@ async def _rollup_task() -> None:
     await _periodic("rollup", 60, _run)
 
 
+def _select_provider(
+    token: TokenDescriptor, futures_provider: BinanceFuturesProvider, onchain_provider: OnChainProvider
+):
+    if token.address:
+        return onchain_provider
+    extra = token.extra or {}
+    if extra.get("type") == "onchain" or token.chain:
+        return onchain_provider
+    if isinstance(token.identifier, str) and token.identifier.lower().startswith("0x"):
+        return onchain_provider
+    return futures_provider
+
+
 async def _rules_task() -> None:
     async def _run() -> None:
         await asyncio.to_thread(run_volume_spike, "5m")
@@ -83,22 +96,9 @@ async def _dex_task() -> None:
     await _periodic("dex", 60, _run)
 
 
-def _is_onchain_token(token: TokenDescriptor) -> bool:
-    return bool(token.chain or token.address or ((token.extra or {}).get("type") == "onchain"))
-
-
-def _select_provider(
-    token: TokenDescriptor,
-    futures_provider: BinanceFuturesProvider,
-    onchain_provider: OnChainProvider,
-) -> Provider:
-    return onchain_provider if _is_onchain_token(token) else futures_provider
-
-
 async def _monitor_task(
     futures_provider: BinanceFuturesProvider,
     onchain_provider: OnChainProvider,
-    endpoint_urls: str,
     targets: Iterable[MonitoredTarget],
 ) -> None:
     async def _run() -> None:
@@ -106,16 +106,15 @@ async def _monitor_task(
             if not getattr(target, "enabled", True):
                 continue
             provider = _select_provider(target.token, futures_provider, onchain_provider)
-            LOGGER.info(
-                "正在通过 %s 监控 %s (endpoint: %s)",
-                provider.name,
-                target.token.symbol,
-                endpoint_urls,
+            LOGGER.info("正在通过 %s 监控 %s", provider.name, target.token.symbol)
+            quote = await provider.current_quote_async(target.token)
+            if quote is None:
+                continue
+            await asyncio.to_thread(
+                scan_price_alerts,
+                None,
+                {target.token.symbol: quote.price},
             )
-            if hasattr(provider, "current_quote_async"):
-                await provider.current_quote_async(target.token)  # type: ignore[attr-defined]
-            else:
-                await asyncio.to_thread(provider.current_quote, target.token)
 
     await _periodic("monitor", 5, _run)
 
@@ -125,20 +124,19 @@ async def loop_forever() -> None:
     event_bus = EventBus()
     NotificationService(event_bus=event_bus, config=app_config)
     futures_provider = BinanceFuturesProvider(event_bus=event_bus)
+    onchain_provider = OnChainProvider(event_bus=event_bus)
     futures_provider.configure_endpoints(
         EndpointConfig(name=ep.name, base_url=ep.base_url, api_key=ep.api_key, priority=ep.priority)
         for ep in app_config.endpoints
     )
-    onchain_provider = OnChainProvider(event_bus=event_bus)
     onchain_provider.configure_endpoints(
         EndpointConfig(name=ep.name, base_url=ep.base_url, api_key=ep.api_key, priority=ep.priority)
         for ep in app_config.endpoints
     )
-    endpoint_urls = ", ".join(ep.base_url for ep in app_config.endpoints) or "(no endpoints configured)"
 
     tasks = [
         asyncio.create_task(
-            _monitor_task(futures_provider, onchain_provider, endpoint_urls, app_config.targets),
+            _monitor_task(futures_provider, onchain_provider, app_config.targets),
             name="provider",
         ),
         asyncio.create_task(_dex_task(), name="dex"),

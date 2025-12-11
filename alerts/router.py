@@ -6,7 +6,6 @@ import asyncio
 import json
 import logging
 import os
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Coroutine, Dict, Iterable, Optional
 
@@ -35,18 +34,15 @@ def _timestamp(ts: float) -> str:
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
-@dataclass(slots=True)
 class NotificationService:
     """Subscribe to events and fan them out to enabled notifiers."""
 
-    event_bus: EventBus
-    config: AppConfig
-    _notifiers: Dict[str, Notifier] = field(init=False, default_factory=dict)
-
     HIGH_PRIORITY_CHANNELS: tuple[str, ...] = ("dingtalk",)
 
-    def __post_init__(self) -> None:
-        self._notifiers = self._build_notifiers(self.config.notifiers)
+    def __init__(self, event_bus: EventBus, config: AppConfig) -> None:
+        self.event_bus = event_bus
+        self.config = config
+        self._notifiers: Dict[str, Notifier] = self._build_notifiers(self.config.notifiers)
         self.event_bus.subscribe(EventType.PRICE_ALERT.value, self._on_price_alert)
         self.event_bus.subscribe(EventType.SYSTEM_FAULT.value, self._on_system_fault)
         LOGGER.info("NotificationService initialized with channels: %s", list(self._notifiers))
