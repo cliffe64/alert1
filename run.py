@@ -5,7 +5,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
-from typing import Awaitable, Callable, Iterable
+import time
+from typing import Awaitable, Callable
 
 from aggregator.rollup import rollup_bars
 from alerts.router import NotificationService
@@ -17,8 +18,8 @@ from core.providers import EndpointConfig, TokenDescriptor
 from rules.price_alerts import scan_price_alerts
 from rules.trend_channel import scan_trend_channel
 from rules.volume_spike import run_volume_spike
-from core.config_models import MonitoredTarget
 from storage.app_config_store import load_app_config
+from storage.sqlite_manager import upsert_bar
 
 LOGGER = logging.getLogger(__name__)
 
@@ -65,19 +66,6 @@ async def _rollup_task() -> None:
     await _periodic("rollup", 60, _run)
 
 
-def _select_provider(
-    token: TokenDescriptor, futures_provider: BinanceFuturesProvider, onchain_provider: OnChainProvider
-):
-    if token.address:
-        return onchain_provider
-    extra = token.extra or {}
-    if extra.get("type") == "onchain" or token.chain:
-        return onchain_provider
-    if isinstance(token.identifier, str) and token.identifier.lower().startswith("0x"):
-        return onchain_provider
-    return futures_provider
-
-
 async def _rules_task() -> None:
     async def _run() -> None:
         await asyncio.to_thread(run_volume_spike, "5m")
@@ -96,27 +84,69 @@ async def _dex_task() -> None:
     await _periodic("dex", 60, _run)
 
 
-async def _monitor_task(
-    futures_provider: BinanceFuturesProvider,
-    onchain_provider: OnChainProvider,
-    targets: Iterable[MonitoredTarget],
+def _build_bar_payload(token: TokenDescriptor, price: float, ts: float, source: str) -> dict:
+    symbol = token.symbol
+    base = symbol[:-4]
+    quote = symbol[-4:] if len(symbol) > 4 else ""
+    return {
+        "source": source,
+        "exchange": source,
+        "chain": getattr(token, "chain", None) or "",
+        "symbol": symbol,
+        "base": base,
+        "quote": quote,
+        "open_ts": int(ts),
+        "close_ts": int(ts),
+        "open": price,
+        "high": price,
+        "low": price,
+        "close": price,
+        "volume_base": 0.0,
+        "volume_quote": 0.0,
+        "notional_usd": 0.0,
+        "trades": 0,
+    }
+
+
+async def _price_poll_task(
+    futures_provider: BinanceFuturesProvider, onchain_provider: OnChainProvider
 ) -> None:
-    async def _run() -> None:
-        for target in targets:
+    while True:
+        app_config = load_app_config()
+        futures_provider.configure_endpoints(
+            EndpointConfig(
+                name=ep.name, base_url=ep.base_url, api_key=ep.api_key, priority=ep.priority
+            )
+            for ep in app_config.endpoints
+        )
+        onchain_provider.configure_endpoints(
+            EndpointConfig(
+                name=ep.name, base_url=ep.base_url, api_key=ep.api_key, priority=ep.priority
+            )
+            for ep in app_config.endpoints
+        )
+
+        for target in app_config.targets:
             if not getattr(target, "enabled", True):
                 continue
-            provider = _select_provider(target.token, futures_provider, onchain_provider)
-            LOGGER.info("正在通过 %s 监控 %s", provider.name, target.token.symbol)
-            quote = await provider.current_quote_async(target.token)
+            provider = (
+                onchain_provider
+                if target.token.chain or target.token.address
+                else futures_provider
+            )
+            LOGGER.info("轮询 %s 最新价格 (via %s)", target.token.symbol, provider.name)
+            quote = await asyncio.to_thread(provider.current_quote, target.token)
             if quote is None:
                 continue
-            await asyncio.to_thread(
-                scan_price_alerts,
-                None,
-                {target.token.symbol: quote.price},
+            bar = _build_bar_payload(
+                target.token,
+                quote.price,
+                quote.ts or time.time(),
+                source=provider.name,
             )
+            await asyncio.to_thread(upsert_bar, "bars_1m", bar)
 
-    await _periodic("monitor", 5, _run)
+        await asyncio.sleep(5)
 
 
 async def loop_forever() -> None:
@@ -129,16 +159,9 @@ async def loop_forever() -> None:
         EndpointConfig(name=ep.name, base_url=ep.base_url, api_key=ep.api_key, priority=ep.priority)
         for ep in app_config.endpoints
     )
-    onchain_provider.configure_endpoints(
-        EndpointConfig(name=ep.name, base_url=ep.base_url, api_key=ep.api_key, priority=ep.priority)
-        for ep in app_config.endpoints
-    )
 
     tasks = [
-        asyncio.create_task(
-            _monitor_task(futures_provider, onchain_provider, app_config.targets),
-            name="provider",
-        ),
+        asyncio.create_task(_price_poll_task(futures_provider, onchain_provider), name="price_poll"),
         asyncio.create_task(_dex_task(), name="dex"),
         asyncio.create_task(_rollup_task(), name="rollup"),
         asyncio.create_task(_rules_task(), name="rules"),

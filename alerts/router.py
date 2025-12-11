@@ -107,10 +107,12 @@ class NotificationService:
             category="system",
         )
         high_priority = [
-            switch.name
-            for switch in self.config.notifiers
-            if switch.enabled and switch.name in self.HIGH_PRIORITY_CHANNELS
+            name for name in self.HIGH_PRIORITY_CHANNELS if name in self._notifiers
         ]
+        if not high_priority:
+            LOGGER.warning(
+                "No high-priority notifier configured; falling back to enabled list"
+            )
         await self._send_to_enabled(message, force_channels=high_priority or None)
 
     async def _send_to_enabled(
