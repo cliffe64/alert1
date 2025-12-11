@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import random
+import logging
+import re
 from typing import Iterable, List, Optional
 
 import httpx
@@ -17,6 +19,8 @@ from core.event_bus import EventBus
 from core.events import EventEnvelope, EventType, Severity, SystemFaultEvent
 from core.health import Endpoint, EndpointPool
 from core.providers import EndpointConfig, Provider, Quote, TokenDescriptor
+
+LOGGER = logging.getLogger(__name__)
 
 
 STATIC_TOKENS: list[TokenDescriptor] = [
@@ -80,7 +84,7 @@ class OnChainProvider(Provider):
     @staticmethod
     def _looks_like_address(query: str) -> bool:
         q = query.lower().strip()
-        return q.startswith("0x") or len(q) > 20
+        return bool(re.fullmatch(r"0x[0-9a-f]{6,}", q)) or len(q) > 20
 
     def _emit_fault(self, endpoint: Endpoint, category: str, reason: str) -> None:
         if not self._event_bus:
@@ -96,6 +100,16 @@ class OnChainProvider(Provider):
         )
         self._event_bus.publish(EventEnvelope(event=event, ts=asyncio.get_event_loop().time()))
 
+    def _dedupe(self, tokens: Iterable[TokenDescriptor]) -> List[TokenDescriptor]:
+        seen: set[str] = set()
+        result: list[TokenDescriptor] = []
+        for token in tokens:
+            if token.identifier in seen:
+                continue
+            seen.add(token.identifier)
+            result.append(token)
+        return result
+
     async def search_tokens_async(self, query: str) -> List[TokenDescriptor]:
         q = query.strip()
         if not q:
@@ -105,20 +119,27 @@ class OnChainProvider(Provider):
         if self._pool.endpoints:
             try:
                 data = await self._request("/search", params={"q": q})
-                tokens = data.get("tokens", data if isinstance(data, list) else [])
-                for item in tokens:
-                    address = item.get("address") or item.get("id")
+                pairs = data.get("pairs") if isinstance(data, dict) else None
+                items = pairs if pairs is not None else data
+                for item in items or []:
+                    base_token = item.get("baseToken") or {}
+                    address = base_token.get("address") or item.get("pairAddress") or item.get("address")
+                    name = base_token.get("name") or item.get("name") or item.get("symbol") or q
+                    symbol = base_token.get("symbol") or item.get("symbol") or name[:10]
+                    chain = item.get("chainId") or item.get("chain")
+                    identifier = item.get("identifier") or address or f"{symbol}_{chain}" if chain else symbol
                     results.append(
                         TokenDescriptor(
-                            identifier=item.get("identifier", address or item.get("symbol", q)),
-                            name=item.get("name", item.get("symbol", q)),
-                            symbol=item.get("symbol", q[:10]),
-                            chain=item.get("chain"),
+                            identifier=str(identifier),
+                            name=str(name),
+                            symbol=str(symbol),
+                            chain=str(chain) if chain else None,
                             address=address,
                             extra={"source": item.get("source", "endpoint"), "type": "onchain"},
                         )
                     )
             except Exception as exc:
+                LOGGER.warning("Token search failed via endpoints: %s", exc)
                 for endpoint in self._pool.endpoints:
                     self._emit_fault(endpoint, "api", str(exc))
 
@@ -129,16 +150,42 @@ class OnChainProvider(Provider):
                 resolved = self.resolve_token(q)
                 if resolved:
                     results.append(resolved)
-        return results
+        return self._dedupe(results)
 
     def search_tokens(self, query: str) -> List[TokenDescriptor]:
         return asyncio.get_event_loop().run_until_complete(self.search_tokens_async(query))
 
-    def resolve_token(self, address: str) -> Optional[TokenDescriptor]:
+    async def resolve_token_async(self, address: str) -> Optional[TokenDescriptor]:
         addr = address.strip()
-        if not addr:
+        if not addr or not self._looks_like_address(addr):
             return None
-        symbol = addr[:6] + "..." if len(addr) > 6 else addr
+
+        if self._pool.endpoints:
+            try:
+                data = await self._request(f"/tokens/{addr}")
+                pairs = data.get("pairs") if isinstance(data, dict) else None
+                pair = (pairs or [None])[0]
+                base_token = pair.get("baseToken") if isinstance(pair, dict) else None
+                if base_token:
+                    symbol = base_token.get("symbol") or addr[:10]
+                    name = base_token.get("name") or symbol
+                    chain = pair.get("chainId") if isinstance(pair, dict) else None
+                    return TokenDescriptor(
+                        identifier=addr,
+                        name=str(name),
+                        symbol=str(symbol),
+                        chain=str(chain) if chain else None,
+                        address=addr,
+                        extra={"source": pair.get("source", "endpoint") if isinstance(pair, dict) else "endpoint", "type": "onchain"},
+                    )
+            except Exception as exc:
+                LOGGER.warning("Resolve token via endpoint failed: %s", exc)
+                for endpoint in self._pool.endpoints:
+                    self._emit_fault(endpoint, "api", str(exc))
+
+        if not re.fullmatch(r"0x[0-9a-fA-F]{6,}", addr):
+            return None
+        symbol = addr[:6] + "..." if len(addr) > 10 else addr
         return TokenDescriptor(
             identifier=addr,
             name=addr,
@@ -148,25 +195,39 @@ class OnChainProvider(Provider):
             extra={"source": "address", "type": "onchain"},
         )
 
+    def resolve_token(self, address: str) -> Optional[TokenDescriptor]:
+        return asyncio.get_event_loop().run_until_complete(self.resolve_token_async(address))
+
     def _synthetic_price(self, token: TokenDescriptor) -> float:
         random.seed(token.identifier)
         return round(random.random(), 6) or 0.000001
 
+    def _extract_quote(self, data: dict, token: TokenDescriptor) -> Optional[Quote]:
+        pairs = data.get("pairs") if isinstance(data, dict) else None
+        pair = (pairs or [None])[0]
+        if not isinstance(pair, dict):
+            return None
+        price = pair.get("priceUsd") or pair.get("price")
+        volume = pair.get("txns", {}).get("h24") if isinstance(pair.get("txns"), dict) else pair.get("volume")
+        if price is None:
+            return None
+        return Quote(
+            symbol=token.symbol,
+            price=float(price),
+            volume=float(volume) if volume is not None else None,
+            ts=asyncio.get_event_loop().time(),
+        )
+
     async def current_quote_async(self, token: TokenDescriptor) -> Optional[Quote]:
-        params = {"address": token.address or token.identifier}
+        params = token.address or token.identifier
         try:
-            if self._pool.endpoints:
-                data = await self._request("/quote", params=params)
-                price = data.get("price") or data.get("data", {}).get("price")
-                volume = data.get("volume") or data.get("data", {}).get("volume")
-                if price is not None:
-                    return Quote(
-                        symbol=token.symbol,
-                        price=float(price),
-                        volume=float(volume) if volume is not None else None,
-                        ts=asyncio.get_event_loop().time(),
-                    )
+            if self._pool.endpoints and params:
+                data = await self._request(f"/tokens/{params}")
+                quote = self._extract_quote(data, token)
+                if quote:
+                    return quote
         except Exception as exc:
+            LOGGER.warning("On-chain quote failed: %s", exc)
             for endpoint in self._pool.endpoints:
                 self._emit_fault(endpoint, "api", str(exc))
         return Quote(symbol=token.symbol, price=self._synthetic_price(token), ts=asyncio.get_event_loop().time())

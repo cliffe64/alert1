@@ -247,18 +247,23 @@ def _target_rules_panel(config) -> None:
             else:
                 st.error("无法解析该地址")
     if st.button("地址添加"):
-        token = TokenDescriptor(
-            identifier=addr,
-            name=name or addr,
-            symbol=(name or addr)[:10],
-            chain=chain or None,
-            address=addr,
-        )
-        target = MonitoredTarget(token=token, rules=[], enabled=True)
-        updated = app_config_store.upsert_target(config, target)
-        st.success("已通过地址添加")
-        st.session_state["config"] = updated
-        st.rerun()
+        token = onchain_provider.resolve_token(addr)
+        if not token:
+            st.error("地址格式无效，无法添加")
+        else:
+            final_token = TokenDescriptor(
+                identifier=token.identifier,
+                name=name or token.name,
+                symbol=(name or token.symbol)[:10],
+                chain=chain or token.chain,
+                address=token.address,
+                extra=token.extra,
+            )
+            target = MonitoredTarget(token=final_token, rules=[], enabled=True)
+            updated = app_config_store.upsert_target(config, target)
+            st.success("已通过地址添加")
+            st.session_state["config"] = updated
+            st.rerun()
 
     st.subheader("已配置监控对象")
     if not config.targets:
